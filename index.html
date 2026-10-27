@@ -1,11 +1,263 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hello World 页面</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto Leveling Simulator</title>
+<style>
+  body { margin: 0; padding: 12px; font-family: "Microsoft YaHei", system-ui, sans-serif;
+         background: #f2f2f2; color: #333; display: flex; flex-direction: column; align-items: center; }
+  #wrap { background: #fff; border: 1px solid #ccc; max-width: 100%; }
+  canvas { display: block; max-width: 100%; height: auto; touch-action: none; background: #fff; }
+  #bar { padding: 6px 10px; }
+  button { width: 80px; padding: 4px 0; font: bold 14px "Microsoft YaHei", sans-serif; cursor: pointer; }
+  footer { margin-top: 8px; font-size: 12px; color: #777; }
+</style>
 </head>
 <body>
-    <h1>Hello, World!</h1>
+<div id="wrap">
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="bar"><button id="stop">Stop</button></div>
+</div>
+<footer>Copyright (c) 2026 Xu. All rights reserved.</footer>
+
+<script>
+"use strict";
+// ------------------------- 基本参数（与 Python 版一致） -------------------------
+const CANVAS_W = 800, CANVAS_H = 600;
+const LINE_X0 = 100, LINE_X1 = 700, LINE_LOGIC_Y = 450;
+const MOTOR_LOGIC_X = 100, MOTOR_LOGIC_Y = 300, MOTOR_MAX_X = 700;
+const SPEED = 100.0;          // 像素/秒
+const NEAR_THRESHOLD = 60;
+const WAIT_MS = 500;
+const TITLE = "Auto Leveling Simulator.";
+const FONT = '"Microsoft YaHei", sans-serif';
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const toScreenY = ly => CANVAS_H - ly;
+
+const lineY = toScreenY(LINE_LOGIC_Y);
+const motorY = toScreenY(MOTOR_LOGIC_Y);
+const redTipY = lineY - 8, redBaseY = redTipY - 30;
+const greenTipY = lineY + 8, greenBaseY = greenTipY + 30;
+const arrowHalfW = 12;
+
+// ------------------------- 状态 -------------------------
+const S = {
+  redX: LINE_X0, greenX: LINE_X0, ballX: MOTOR_LOGIC_X, blueX: null,
+  dragging: false, isAnimating: false, waiting: false, waitEnd: 0,
+  steps: [], stepIndex: 0, targetRedX: null,
+};
+
+// ------------------------- 绘制 -------------------------
+function tri(pts, fill, stroke) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0], pts[1]);
+  for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+  ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke();
+}
+
+function redraw() {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  // 标题
+  ctx.fillStyle = "#333"; ctx.font = "12pt " + FONT;
+  ctx.fillText(TITLE, CANVAS_W / 2, 20);
+
+  // 电机机身
+  ctx.fillStyle = "#555"; ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+  ctx.fillRect(MOTOR_LOGIC_X - 40, motorY - 20, 40, 40);
+  ctx.strokeRect(MOTOR_LOGIC_X - 40, motorY - 20, 40, 40);
+
+  // 球头轨道（虚线）
+  ctx.setLineDash([4, 3]); ctx.strokeStyle = "#ccc"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(MOTOR_LOGIC_X, motorY); ctx.lineTo(MOTOR_MAX_X, motorY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 横线
+  ctx.strokeStyle = "#000"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(LINE_X0, lineY); ctx.lineTo(LINE_X1, lineY); ctx.stroke();
+
+  // 不感帯
+  const dzL = Math.max(LINE_X0, S.ballX - NEAR_THRESHOLD);
+  const dzR = Math.min(LINE_X1, S.ballX + NEAR_THRESHOLD);
+  ctx.fillStyle = "rgba(114,112,112,0.45)";
+  ctx.fillRect(dzL, lineY - 16, dzR - dzL, 32);
+  ctx.setLineDash([4, 2]); ctx.strokeStyle = "#000"; ctx.lineWidth = 2;
+  ctx.strokeRect(dzL, lineY - 16, dzR - dzL, 32);
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#696464"; ctx.font = "bold 9pt " + FONT;
+  ctx.fillText("不感帯", dzL, lineY - 26);
+
+  // 连杆 + 球头
+  ctx.strokeStyle = "#888"; ctx.lineWidth = 8; ctx.lineCap = "butt";
+  ctx.beginPath(); ctx.moveTo(MOTOR_LOGIC_X, motorY); ctx.lineTo(S.ballX, motorY); ctx.stroke();
+  ctx.beginPath(); ctx.arc(S.ballX, motorY, 14, 0, Math.PI * 2);
+  ctx.fillStyle = "#aaa"; ctx.fill();
+  ctx.strokeStyle = "#000"; ctx.lineWidth = 2; ctx.stroke();
+
+  // 红色箭头（尖端朝下）
+  tri([S.redX, redTipY, S.redX - arrowHalfW, redBaseY, S.redX + arrowHalfW, redBaseY], "red", "darkred");
+  // 绿色箭头（尖端朝上）
+  tri([S.greenX, greenTipY, S.greenX - arrowHalfW, greenBaseY, S.greenX + arrowHalfW, greenBaseY], "green", "darkgreen");
+  // 蓝色箭头
+  if (S.blueX !== null) {
+    const b = S.blueX;
+    tri([b, lineY - 14, b - 10, lineY, b, lineY + 14], "blue", "darkblue");
+  }
+}
+
+// ------------------------- 拖拽 -------------------------
+function eventX(e) {
+  const r = canvas.getBoundingClientRect();
+  return (e.clientX - r.left) * (CANVAS_W / r.width);
+}
+function eventY(e) {
+  const r = canvas.getBoundingClientRect();
+  return (e.clientY - r.top) * (CANVAS_H / r.height);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const x = eventX(e), y = eventY(e);
+  // 命中红色箭头（略放宽，方便触屏）
+  if (Math.abs(x - S.redX) <= arrowHalfW + 6 && y >= redBaseY - 6 && y <= redTipY + 6) {
+    S.dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+    S.greenX = S.redX;   // 开始拖动时，绿箭头记录当前红箭头位置
+    redraw();
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!S.dragging) return;
+  S.redX = Math.max(LINE_X0, Math.min(LINE_X1, Math.round(eventX(e))));
+  redraw();
+});
+function endDrag() {
+  if (!S.dragging) return;
+  S.dragging = false;
+  startMotion();
+}
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+document.getElementById("stop").addEventListener("click", () => stopImmediately(S.redX));
+
+// ------------------------- 动作封装 -------------------------
+function stopImmediately(redX, blueX = null) {
+  S.isAnimating = false; S.waiting = false; S.steps = []; S.stepIndex = 0;
+  S.blueX = blueX; S.targetRedX = redX; S.greenX = redX;
+  redraw();
+}
+function flyDirectlyTo(redX) {
+  S.targetRedX = redX;
+  S.steps = [{ target: redX, waitAfter: 0, blue: null }];
+  S.stepIndex = 0; S.isAnimating = true; S.waiting = false; S.blueX = null;
+  redraw();
+}
+function startBlueDetour(blueX, redX) {
+  S.targetRedX = redX;
+  S.steps = [
+    { target: blueX, waitAfter: WAIT_MS, blue: blueX },
+    { target: redX, waitAfter: 0, blue: null },
+  ];
+  S.stepIndex = 0; S.isAnimating = true; S.waiting = false; S.blueX = blueX;
+  redraw();
+}
+function waitThenReverseTo(redX) {
+  S.targetRedX = redX;
+  S.steps = [
+    { target: S.ballX, waitAfter: WAIT_MS, blue: null },
+    { target: redX, waitAfter: 0, blue: null },
+  ];
+  S.stepIndex = 0; S.isAnimating = true; S.waiting = false; S.blueX = null;
+  redraw();
+}
+
+// ------------------------- 运动规划 -------------------------
+function startMotion() {
+  const redX = S.redX, greenX = S.greenX, ballX = S.ballX;
+  const dist = Math.abs(redX - greenX);
+
+  if (dist > NEAR_THRESHOLD) {
+    if (S.isAnimating) {
+      const dir = S.targetRedX >= ballX ? 1 : -1;
+      const redAhead = (redX - ballX) * dir >= 0;
+      if (redAhead) flyDirectlyTo(redX);
+      else if (Math.abs(ballX - redX) < NEAR_THRESHOLD) stopImmediately(redX);
+      else waitThenReverseTo(redX);
+    } else {
+      if (Math.abs(ballX - redX) < NEAR_THRESHOLD) stopImmediately(redX);
+      else flyDirectlyTo(redX);
+    }
+    return;
+  }
+
+  // 距离太近：计算蓝色箭头位置
+  let blueX;
+  if (redX >= greenX) {
+    blueX = redX + NEAR_THRESHOLD;
+    if (blueX > LINE_X1) blueX = greenX - NEAR_THRESHOLD;
+  } else {
+    blueX = redX - NEAR_THRESHOLD;
+    if (blueX < LINE_X0) blueX = greenX + NEAR_THRESHOLD;
+  }
+
+  let blueAhead;
+  if (S.isAnimating) {
+    const dir = S.targetRedX >= ballX ? 1 : -1;
+    blueAhead = (blueX - ballX) * dir >= 0;
+  } else {
+    blueAhead = Math.abs(ballX - blueX) >= NEAR_THRESHOLD;
+  }
+
+  if (blueAhead) startBlueDetour(blueX, redX);
+  else if (Math.abs(ballX - blueX) < NEAR_THRESHOLD) stopImmediately(redX, blueX);
+  else startBlueDetour(blueX, redX);
+}
+
+// ------------------------- 动画主循环 -------------------------
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);  // 切后台回来时避免跳变
+  last = now;
+
+  if (S.isAnimating) {
+    if (S.waiting) {
+      if (now >= S.waitEnd) {
+        S.waiting = false;
+        S.stepIndex++;
+        if (S.stepIndex < S.steps.length) S.blueX = S.steps[S.stepIndex].blue;
+      }
+    } else {
+      const step = S.steps[S.stepIndex];
+      const move = SPEED * dt;
+      if (S.ballX < step.target) S.ballX = Math.min(step.target, S.ballX + move);
+      else if (S.ballX > step.target) S.ballX = Math.max(step.target, S.ballX - move);
+
+      if (Math.abs(S.ballX - step.target) < 0.5) {
+        S.ballX = step.target;
+        if (step.waitAfter > 0) {
+          S.waiting = true;
+          S.waitEnd = now + step.waitAfter;
+        } else if (S.stepIndex < S.steps.length - 1) {
+          S.stepIndex++;
+          S.blueX = S.steps[S.stepIndex].blue;
+        } else {
+          S.isAnimating = false;
+          S.blueX = null;
+        }
+      }
+    }
+    redraw();
+  }
+  requestAnimationFrame(tick);
+}
+
+redraw();
+requestAnimationFrame(tick);
+</script>
 </body>
 </html>
